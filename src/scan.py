@@ -9,10 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-import finnhub
 import pandas as pd
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 
 from scoring import StockScorer
@@ -77,41 +75,54 @@ def most_recent_resistance(df: pd.DataFrame, lookback: int = 60) -> float:
     return float(df["High"].iloc[-lookback:-1].max())
 
 
-def get_days_to_earnings(ticker: str) -> int:
-    tk = yf.Ticker(ticker)
-    calendar = tk.calendar
-    if calendar is None or len(calendar) == 0:
+def finnhub_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
+    time.sleep(0.25)
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_days_to_earnings(ticker: str, api_key: str) -> int:
+    now = dt.datetime.now(dt.timezone.utc).date()
+    future_limit = now + dt.timedelta(days=365)
+    payload = finnhub_get(
+        "https://finnhub.io/api/v1/calendar/earnings",
+        {
+            "symbol": ticker,
+            "from": now.isoformat(),
+            "to": future_limit.isoformat(),
+            "token": api_key,
+        },
+    )
+    earnings_rows = payload.get("earningsCalendar", []) or []
+    if not earnings_rows:
         return 999
 
-    if isinstance(calendar, pd.DataFrame):
-        values = calendar.values.flatten().tolist()
-    else:
-        values = list(calendar.values())
+    next_days: list[int] = []
+    for row in earnings_rows:
+        date_text = row.get("date")
+        if not date_text:
+            continue
+        earnings_date = dt.date.fromisoformat(date_text)
+        delta = (earnings_date - now).days
+        if delta >= 0:
+            next_days.append(delta)
 
-    now = dt.datetime.now(dt.timezone.utc).date()
-    for item in values:
-        if hasattr(item, "date"):
-            earnings_date = item.date()
-            return max((earnings_date - now).days, 0)
-    return 999
+    return min(next_days) if next_days else 999
 
 
-def get_sector_and_market_cap(ticker: str, finnhub_client: finnhub.Client) -> tuple[Optional[str], Optional[float]]:
-    profile = finnhub_client.company_profile2(symbol=ticker) or {}
+def get_sector_and_market_cap(ticker: str, api_key: str) -> tuple[Optional[str], Optional[float]]:
+    profile = finnhub_get(
+        "https://finnhub.io/api/v1/stock/profile2",
+        {"symbol": ticker, "token": api_key},
+    )
     market_cap = profile.get("marketCapitalization")
     finnhub_industry = profile.get("finnhubIndustry")
-
-    if market_cap and finnhub_industry:
-        return finnhub_industry, float(market_cap) * 1_000_000
-
-    yf_info = yf.Ticker(ticker).info
-    market_cap = market_cap or yf_info.get("marketCap")
-    sector = finnhub_industry or yf_info.get("sector")
-    return sector, float(market_cap) if market_cap else None
+    return finnhub_industry, float(market_cap) * 1_000_000 if market_cap else None
 
 
-def fetch_us_symbols(finnhub_client: finnhub.Client) -> Iterable[str]:
-    symbols = finnhub_client.stock_symbols("US")
+def fetch_us_symbols(api_key: str) -> Iterable[str]:
+    symbols = finnhub_get("https://finnhub.io/api/v1/stock/symbol", {"exchange": "US", "token": api_key})
     for row in symbols:
         symbol = row.get("symbol", "")
         symbol_type = row.get("type", "")
@@ -119,10 +130,35 @@ def fetch_us_symbols(finnhub_client: finnhub.Client) -> Iterable[str]:
             yield symbol
 
 
-def download_ohlcv(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
-    df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
-    if df is None or df.empty:
+def download_ohlcv(symbol: str, api_key: str, period_days: int = 365) -> Optional[pd.DataFrame]:
+    now = dt.datetime.now(dt.timezone.utc)
+    start = now - dt.timedelta(days=period_days)
+    payload = finnhub_get(
+        "https://finnhub.io/api/v1/stock/candle",
+        {
+            "symbol": symbol,
+            "resolution": "D",
+            "from": int(start.timestamp()),
+            "to": int(now.timestamp()),
+            "token": api_key,
+        },
+    )
+    if payload.get("s") != "ok":
         return None
+
+    df = pd.DataFrame(
+        {
+            "Open": payload.get("o", []),
+            "High": payload.get("h", []),
+            "Low": payload.get("l", []),
+            "Close": payload.get("c", []),
+            "Volume": payload.get("v", []),
+        },
+        index=pd.to_datetime(payload.get("t", []), unit="s", utc=True),
+    )
+    if df.empty:
+        return None
+
     return df.dropna().copy()
 
 
@@ -163,11 +199,10 @@ def scan() -> list[Candidate]:
     if not api_key:
         raise RuntimeError("FINNHUB_API_KEY is required")
 
-    finnhub_client = finnhub.Client(api_key=api_key)
     scorer = StockScorer()
 
     max_tickers = int(os.getenv("MAX_TICKERS", "0"))
-    symbols = list(fetch_us_symbols(finnhub_client))
+    symbols = list(fetch_us_symbols(api_key))
     if max_tickers > 0:
         symbols = symbols[:max_tickers]
 
@@ -175,14 +210,14 @@ def scan() -> list[Candidate]:
 
     for idx, symbol in enumerate(symbols, start=1):
         try:
-            sector, market_cap = get_sector_and_market_cap(symbol, finnhub_client)
+            sector, market_cap = get_sector_and_market_cap(symbol, api_key)
             if not market_cap or market_cap <= 1_000_000_000:
                 continue
 
             benchmark = SECTOR_ETF_MAP.get(sector or "", "SPY")
 
-            stock_df = download_ohlcv(symbol)
-            benchmark_df = download_ohlcv(benchmark)
+            stock_df = download_ohlcv(symbol, api_key)
+            benchmark_df = download_ohlcv(benchmark, api_key)
             if stock_df is None or benchmark_df is None:
                 continue
 
@@ -233,7 +268,7 @@ def scan() -> list[Candidate]:
             base_tightness = (highs_60.max() - lows_60.min()) / close * 100
             multi_week_pattern = base_tightness < 18 and close >= highs_60.quantile(0.9)
 
-            days_to_earnings = get_days_to_earnings(symbol)
+            days_to_earnings = get_days_to_earnings(symbol, api_key)
 
             metrics: Dict[str, Any] = {
                 "price_vs_sma150_pct": safe_pct_change(sma150_val, close),
