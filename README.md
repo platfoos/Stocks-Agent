@@ -62,5 +62,5 @@ followed by a concise explanation and what constraints to relax.
 ## Notes on data quality
 
 - Primary universe and company profile source: Finnhub.
-- Missing required fields are fetched from yfinance in the same run (e.g., market cap, sector, earnings date).
+- All profile, candles, earnings calendar, and financial metric fallbacks are sourced from Finnhub endpoints only (no Yahoo scraping).
 - No fabricated values are used.
