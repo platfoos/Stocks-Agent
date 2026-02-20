@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
@@ -162,10 +163,20 @@ def download_ohlcv(symbol: str, api_key: str, period_days: int = 365) -> Optiona
     return df.dropna().copy()
 
 
-def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+    df = pd.DataFrame(
+        {
+            "Open": payload.get("o", []),
+            "High": payload.get("h", []),
+            "Low": payload.get("l", []),
+            "Close": payload.get("c", []),
+            "Volume": payload.get("v", []),
+        },
+        index=pd.to_datetime(payload.get("t", []), unit="s", utc=True),
+    )
+
+    if df.empty:
+        return None
+    return df.dropna().copy()
 
 
 def build_trade_levels(df: pd.DataFrame, atr14: float, resistance: float) -> tuple[float, float, float, float, float]:
@@ -207,6 +218,7 @@ def scan() -> list[Candidate]:
         symbols = symbols[:max_tickers]
 
     results: list[Candidate] = []
+    benchmark_cache: dict[str, pd.DataFrame] = {}
 
     for idx, symbol in enumerate(symbols, start=1):
         try:
@@ -220,9 +232,6 @@ def scan() -> list[Candidate]:
             benchmark_df = download_ohlcv(benchmark, api_key)
             if stock_df is None or benchmark_df is None:
                 continue
-
-            stock_df = flatten_columns(stock_df)
-            benchmark_df = flatten_columns(benchmark_df)
 
             stock_df["SMA150"] = sma(stock_df["Close"], 150)
             stock_df["ATR14"] = atr(stock_df, 14)
@@ -318,7 +327,7 @@ def scan() -> list[Candidate]:
 
             if idx % 40 == 0:
                 time.sleep(1.2)
-        except (requests.RequestException, KeyError, ValueError):
+        except (requests.RequestException, KeyError, ValueError, finnhub.FinnhubAPIException):
             continue
 
     return sorted(results, key=lambda c: c.score, reverse=True)

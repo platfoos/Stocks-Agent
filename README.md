@@ -62,5 +62,6 @@ followed by a concise explanation and what constraints to relax.
 ## Notes on data quality
 
 - Primary universe and company profile source: Finnhub.
+- All profile, candles, earnings calendar, and financial metric fallbacks are sourced from Finnhub endpoints only (no Yahoo scraping).
 - Company profile (`/stock/profile2`), OHLCV candles (`/stock/candle`), and earnings calendar (`/calendar/earnings`) are fetched directly from Finnhub with rate-limit protection (0.25s sleep between requests).
 - No fabricated values are used.
