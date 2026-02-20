@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlencode
 
-import finnhub
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -77,98 +76,54 @@ def most_recent_resistance(df: pd.DataFrame, lookback: int = 60) -> float:
     return float(df["High"].iloc[-lookback:-1].max())
 
 
-def finnhub_get_json(api_key: str, endpoint: str, params: dict[str, Any], retries: int = 4) -> dict[str, Any]:
-    base_url = "https://finnhub.io/api/v1"
-    query = dict(params)
-    query["token"] = api_key
-    url = f"{base_url}/{endpoint}?{urlencode(query)}"
-
-    for attempt in range(retries):
-        response = requests.get(url, timeout=20)
-        if response.status_code == 429:
-            time.sleep(min(2 ** attempt, 8))
-            continue
-        response.raise_for_status()
-        return response.json()
-
-    raise requests.HTTPError("Finnhub request failed after retries due to rate limiting")
-
-
-def normalize_market_cap(raw_value: Any) -> Optional[float]:
-    if raw_value in (None, ""):
-        return None
-    try:
-        value = float(raw_value)
-    except (TypeError, ValueError):
-        return None
-
-    if value <= 0:
-        return None
-
-    # company_profile2 typically returns market cap in millions.
-    if value < 1_000_000:
-        return value * 1_000_000
-    return value
+def finnhub_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
+    time.sleep(0.25)
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
 
 
 def get_days_to_earnings(ticker: str, api_key: str) -> int:
     now = dt.datetime.now(dt.timezone.utc).date()
-    horizon = now + dt.timedelta(days=180)
-
-    payload = finnhub_get_json(
-        api_key,
-        "calendar/earnings",
+    future_limit = now + dt.timedelta(days=365)
+    payload = finnhub_get(
+        "https://finnhub.io/api/v1/calendar/earnings",
         {
-            "from": now.isoformat(),
-            "to": horizon.isoformat(),
             "symbol": ticker,
-            "international": "false",
+            "from": now.isoformat(),
+            "to": future_limit.isoformat(),
+            "token": api_key,
         },
     )
-    earnings_rows = payload.get("earningsCalendar", [])
+    earnings_rows = payload.get("earningsCalendar", []) or []
     if not earnings_rows:
         return 999
 
-    valid_dates: list[dt.date] = []
+    next_days: list[int] = []
     for row in earnings_rows:
-        date_str = row.get("date")
-        if not date_str:
+        date_text = row.get("date")
+        if not date_text:
             continue
-        try:
-            valid_dates.append(dt.date.fromisoformat(date_str))
-        except ValueError:
-            continue
+        earnings_date = dt.date.fromisoformat(date_text)
+        delta = (earnings_date - now).days
+        if delta >= 0:
+            next_days.append(delta)
 
-    future = sorted(d for d in valid_dates if d >= now)
-    if not future:
-        return 999
-    return (future[0] - now).days
+    return min(next_days) if next_days else 999
 
 
-def get_sector_and_market_cap(ticker: str, finnhub_client: finnhub.Client) -> tuple[Optional[str], Optional[float]]:
-    profile = finnhub_client.company_profile2(symbol=ticker) or {}
-    market_cap = normalize_market_cap(profile.get("marketCapitalization"))
-    sector = profile.get("finnhubIndustry")
-
-    if market_cap and sector:
-        return sector, market_cap
-
-    if market_cap:
-        return sector, market_cap
-
-    # Fallback to Finnhub metrics endpoint; no Yahoo dependency.
-    basic_financials = finnhub_client.company_basic_financials(ticker, "all") or {}
-    metric = basic_financials.get("metric", {})
-    metrics_market_cap = (
-        metric.get("marketCapitalization")
-        or metric.get("marketCapitalizationAnnual")
-        or metric.get("marketCapitalizationQuarterly")
+def get_sector_and_market_cap(ticker: str, api_key: str) -> tuple[Optional[str], Optional[float]]:
+    profile = finnhub_get(
+        "https://finnhub.io/api/v1/stock/profile2",
+        {"symbol": ticker, "token": api_key},
     )
-    return sector, normalize_market_cap(metrics_market_cap)
+    market_cap = profile.get("marketCapitalization")
+    finnhub_industry = profile.get("finnhubIndustry")
+    return finnhub_industry, float(market_cap) * 1_000_000 if market_cap else None
 
 
-def fetch_us_symbols(finnhub_client: finnhub.Client) -> Iterable[str]:
-    symbols = finnhub_client.stock_symbols("US")
+def fetch_us_symbols(api_key: str) -> Iterable[str]:
+    symbols = finnhub_get("https://finnhub.io/api/v1/stock/symbol", {"exchange": "US", "token": api_key})
     for row in symbols:
         symbol = row.get("symbol", "")
         symbol_type = row.get("type", "")
@@ -176,22 +131,37 @@ def fetch_us_symbols(finnhub_client: finnhub.Client) -> Iterable[str]:
             yield symbol
 
 
-def download_ohlcv(symbol: str, api_key: str, lookback_days: int = 430) -> Optional[pd.DataFrame]:
-    now = int(dt.datetime.now(tz=dt.timezone.utc).timestamp())
-    start = int((dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=lookback_days)).timestamp())
-
-    payload = finnhub_get_json(
-        api_key,
-        "stock/candle",
+def download_ohlcv(symbol: str, api_key: str, period_days: int = 365) -> Optional[pd.DataFrame]:
+    now = dt.datetime.now(dt.timezone.utc)
+    start = now - dt.timedelta(days=period_days)
+    payload = finnhub_get(
+        "https://finnhub.io/api/v1/stock/candle",
         {
             "symbol": symbol,
             "resolution": "D",
-            "from": start,
-            "to": now,
+            "from": int(start.timestamp()),
+            "to": int(now.timestamp()),
+            "token": api_key,
         },
     )
     if payload.get("s") != "ok":
         return None
+
+    df = pd.DataFrame(
+        {
+            "Open": payload.get("o", []),
+            "High": payload.get("h", []),
+            "Low": payload.get("l", []),
+            "Close": payload.get("c", []),
+            "Volume": payload.get("v", []),
+        },
+        index=pd.to_datetime(payload.get("t", []), unit="s", utc=True),
+    )
+    if df.empty:
+        return None
+
+    return df.dropna().copy()
+
 
     df = pd.DataFrame(
         {
@@ -240,11 +210,10 @@ def scan() -> list[Candidate]:
     if not api_key:
         raise RuntimeError("FINNHUB_API_KEY is required")
 
-    finnhub_client = finnhub.Client(api_key=api_key)
     scorer = StockScorer()
 
     max_tickers = int(os.getenv("MAX_TICKERS", "0"))
-    symbols = list(fetch_us_symbols(finnhub_client))
+    symbols = list(fetch_us_symbols(api_key))
     if max_tickers > 0:
         symbols = symbols[:max_tickers]
 
@@ -253,18 +222,14 @@ def scan() -> list[Candidate]:
 
     for idx, symbol in enumerate(symbols, start=1):
         try:
-            sector, market_cap = get_sector_and_market_cap(symbol, finnhub_client)
+            sector, market_cap = get_sector_and_market_cap(symbol, api_key)
             if not market_cap or market_cap <= 1_000_000_000:
                 continue
 
             benchmark = SECTOR_ETF_MAP.get(sector or "", "SPY")
 
             stock_df = download_ohlcv(symbol, api_key)
-            benchmark_df = benchmark_cache.get(benchmark)
-            if benchmark_df is None:
-                benchmark_df = download_ohlcv(benchmark, api_key)
-                if benchmark_df is not None:
-                    benchmark_cache[benchmark] = benchmark_df
+            benchmark_df = download_ohlcv(benchmark, api_key)
             if stock_df is None or benchmark_df is None:
                 continue
 
