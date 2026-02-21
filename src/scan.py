@@ -327,7 +327,7 @@ def scan() -> list[Candidate]:
 
             if idx % 40 == 0:
                 time.sleep(1.2)
-        except (requests.RequestException, KeyError, ValueError, finnhub.FinnhubAPIException):
+        except (requests.RequestException, KeyError, ValueError):
             continue
 
     return sorted(results, key=lambda c: c.score, reverse=True)
